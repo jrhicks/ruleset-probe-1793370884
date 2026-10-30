@@ -1,0 +1,24 @@
+name: Approve PRs (test reviewer)
+# Test-repo stand-in for a second reviewer: github-actions[bot] approves the given PRs.
+on:
+  workflow_dispatch:
+    inputs:
+      prs:
+        description: Space-separated PR numbers to approve
+        required: true
+
+jobs:
+  approve:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      PRS: ${{ inputs.prs }}
+    steps:
+      - name: Approve
+        run: |
+          for pr in $PRS; do
+            gh pr review "$pr" --approve --body "Approved by the test reviewer."
+          done
