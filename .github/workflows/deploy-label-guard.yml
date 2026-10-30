@@ -1,0 +1,67 @@
+name: Deploy label guard
+on:
+  # pull_request_target runs this file from main, so it guards every PR, including ones
+  # opened before the guard existed. It never checks out PR code.
+  pull_request_target:
+    types: [labeled, reopened]
+
+jobs:
+  # Only one open PR may hold a deploy: {namespace} label: whoever added it first. Every
+  # other open PR with it loses the label, gets blocked deployment: {namespace}, and the
+  # person who added it there is mentioned. Each run settles the whole label, so a run
+  # that GitHub replaced while it waited leaves nothing unsettled.
+  claim:
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'reopened' || startsWith(github.event.label.name, 'deploy:'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: claim-${{ github.event.label.name || github.event.pull_request.number }}
+      cancel-in-progress: false
+    permissions:
+      issues: write
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      ACTION: ${{ github.event.action }}
+      LABEL: ${{ github.event.label.name }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Keep each deploy label on the PR that added it first
+        run: |
+          # A reopened PR may still carry labels that another PR claimed while it was closed.
+          if [ "$ACTION" = reopened ]; then
+            labels=$(gh pr view "$PR" --json labels --jq '.labels[].name | select(startswith("deploy:"))')
+          else
+            labels=$LABEL
+          fi
+
+          self_blocked=false
+          while read -r label; do
+            [ -n "$label" ] || continue
+            # "<label event id> <pr> <who labelled it>", oldest first. Event ids increase,
+            # so they order claims made within the same second.
+            claims=$(for n in $(gh pr list --label "$label" --state open --limit 1000 --json number --jq '.[].number'); do
+              L=$label N=$n gh api "repos/$GH_REPO/issues/$n/events" --paginate \
+                --jq '.[] | select(.event == "labeled" and .label.name == env.L) | "\(.id) \(env.N) \(.actor.login)"' |
+                tail -1
+            done | sort -n)
+            [ -n "$claims" ] || continue # withdrawn while this run waited
+            winner=$(echo "$claims" | head -1 | cut -d' ' -f2)
+            echo "$label: #$winner holds it"
+
+            blocked="blocked deployment: ${label#deploy: }"
+            echo "$claims" | tail -n +2 | while read -r _ n actor; do
+              # A 404 means another claim run settled this PR first, so it has already been told.
+              if ! out=$(gh api -X DELETE "repos/$GH_REPO/issues/$n/labels/$(jq -rn --arg l "$label" '$l|@uri')" 2>&1); then
+                case $out in *"HTTP 404"*) continue ;; *) echo "$out" >&2; exit 1 ;; esac
+              fi
+              gh api "repos/$GH_REPO/issues/$n/labels" -f "labels[]=$blocked" > /dev/null
+              gh pr comment "$n" --body "@$actor \`$label\` is held by #$winner, so this PR was not deployed. Remove \`$blocked\` and pick a free environment."
+            done
+            echo "$claims" | tail -n +2 | grep -q " $PR " && self_blocked=true
+          done <<< "$labels"
+
+          [ "$self_blocked" = false ]
+
